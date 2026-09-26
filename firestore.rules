@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /games/{gameId} {
+
+      function isOwner() {
+        return request.auth != null && resource.data.ownerId == request.auth.uid;
+      }
+
+      // A player joining: they may only add one name to the end of the list,
+      // and may only close the draw when that fills it.
+      function isJoin() {
+        let before = resource.data;
+        let after = request.resource.data;
+        return before.closed == false
+          && after.diff(before).affectedKeys().hasOnly(['players', 'closed'])
+          && after.players.size() == before.players.size() + 1
+          && after.players.size() <= 60
+          && after.players[0:before.players.size()] == before.players
+          && (after.closed == false
+              || (before.expected != null && after.players.size() >= before.expected));
+      }
+
+      // Anyone with the link can see a match.
+      allow read: if true;
+
+      // Only signed-in coordinators can create matches, and only as themselves.
+      allow create: if request.auth != null
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.players.size() == 0;
+
+      // The coordinator can change anything except who owns it; players can only join.
+      allow update: if (isOwner() && request.resource.data.ownerId == resource.data.ownerId)
+        || isJoin();
+
+      // Only the coordinator can delete their match.
+      allow delete: if isOwner();
+    }
+  }
+}
