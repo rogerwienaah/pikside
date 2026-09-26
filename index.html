@@ -188,7 +188,16 @@ button.big.auth{font-family:"Barlow",system-ui,sans-serif;font-size:19px;font-we
 
   <!-- Signed in: dashboard -->
   <div id="homeView" hidden>
-    <div class="matchinfo"><h1 id="hello">Your matches</h1></div>
+    <div class="matchinfo">
+      <h1 id="hello">Your matches</h1>
+      <button class="link" id="editNameBtn">Change your name</button>
+      <div id="nameForm" hidden>
+        <label class="f" for="newName">Your name (shown to your players)</label>
+        <input type="text" id="newName" maxlength="30" autocomplete="name">
+        <div class="row"><button class="primary" id="saveNameBtn">Save name</button><button id="cancelNameBtn">Cancel</button></div>
+        <p class="err" id="nameErr"></p>
+      </div>
+    </div>
     <section class="panel" id="upgradePanel" hidden>
       <h2>Keep your matches safe</h2>
       <p class="hint">You're using PikSide without an account, so your matches are only saved on this phone. Connect Google to reach them from any device and keep them if you clear your browser.</p>
@@ -215,6 +224,12 @@ button.big.auth{font-family:"Barlow",system-ui,sans-serif;font-size:19px;font-we
       <h2>Your matches</h2>
       <ul class="matches" id="matchList"></ul>
       <p class="hint" id="noMatches" style="margin:6px 0 0">No matches yet. Create one above and it will show up here.</p>
+    </section>
+    <section class="panel">
+      <h2>Your account</h2>
+      <p class="hint">Deleting your account also deletes all your matches, and their links will stop working for players. This can't be undone.</p>
+      <button class="danger" id="deleteAccountBtn" style="width:100%">Delete my account</button>
+      <p class="err" id="deleteErr"></p>
     </section>
   </div>
 
@@ -351,6 +366,13 @@ button.big.auth{font-family:"Barlow",system-ui,sans-serif;font-size:19px;font-we
         const c = await au.linkWithPopup(auth.currentUser, provider);
         return toUser(c.user);
       },
+      async setName(name){ await au.updateProfile(auth.currentUser, { displayName: name }); },
+      // Google asks you to confirm it's you before an account can be deleted
+      async confirmIdentity(){
+        const u = auth.currentUser;
+        if (u && !u.isAnonymous) await au.reauthenticateWithPopup(u, provider);
+      },
+      async deleteAccount(){ await au.deleteUser(auth.currentUser); },
       signOut(){ return au.signOut(auth); },
       async create(id, data){ await fs.setDoc(ref(id), data); },
       subscribe(id, cb){ return fs.onSnapshot(ref(id), s => cb(s.exists() ? s.data() : null), () => cb(null)); },
@@ -399,6 +421,15 @@ button.big.auth{font-family:"Barlow",system-ui,sans-serif;font-size:19px;font-we
       },
       async anon(name){ const u = { uid: rid(10), name, isAnonymous: true }; setUser(u); return u; },
       async linkGoogle(){ const u = { ...current, isAnonymous: false }; setUser(u); return u; },
+      async confirmIdentity(){ },
+      async deleteAccount(){
+        const g = ls.get("demo2-google"); if (g && current && g.uid === current.uid) ls.set("demo2-google", null);
+        setUser(null);
+      },
+      async setName(name){
+        const u = { ...current, name }; setUser(u);
+        const g = ls.get("demo2-google"); if (g && g.uid === u.uid) ls.set("demo2-google", u);
+      },
       async signOut(){ setUser(null); },
       async create(id, data){ games[id] = data; emit(id); },
       subscribe(id, cb){ (gameSubs[id] = gameSubs[id] || []).push(cb); setTimeout(() => cb(games[id] ? clone(games[id]) : null)); return () => { gameSubs[id] = (gameSubs[id]||[]).filter(f => f !== cb); }; },
@@ -494,13 +525,66 @@ button.big.auth{font-family:"Barlow",system-ui,sans-serif;font-size:19px;font-we
     finally { $("linkBtn").disabled = false; }
   };
 
+  /* ---------- Change name ---------- */
+  $("editNameBtn").onclick = () => {
+    $("newName").value = user.name || ""; $("nameErr").textContent = "";
+    $("nameForm").hidden = false; $("editNameBtn").hidden = true; $("newName").focus();
+  };
+  $("cancelNameBtn").onclick = () => { $("nameForm").hidden = true; $("editNameBtn").hidden = false; };
+  $("newName").addEventListener("keydown", e => { if (e.key === "Enter") $("saveNameBtn").click(); });
+  $("saveNameBtn").onclick = async () => {
+    const name = $("newName").value.replace(/\s+/g, " ").trim();
+    if (!name) { $("nameErr").textContent = "Type the name you want players to see."; return; }
+    $("saveNameBtn").disabled = true;
+    try {
+      await api.setName(name);
+      user = { ...user, name };
+      // Update "Organised by" on matches you've already created
+      await Promise.all(myMatches.filter(g => g.ownerName !== name).map(g => api.update(g.id, { ownerName: name })));
+      $("hello").textContent = "Hi " + name.split(" ")[0];
+      $("nameForm").hidden = true; $("editNameBtn").hidden = false;
+      toast("Name updated");
+    } catch(e){ $("nameErr").textContent = "Couldn't save your name. Check your connection and try again."; }
+    finally { $("saveNameBtn").disabled = false; }
+  };
+
+  /* ---------- Delete account ---------- */
+  $("deleteAccountBtn").onclick = async () => {
+    const n = myMatches.length;
+    const what = n ? ` and your ${n} match${n === 1 ? "" : "es"}` : "";
+    if (!confirm(`Delete your PikSide account${what}? Match links will stop working for players. This can't be undone.`)) return;
+    $("deleteErr").textContent = ""; $("deleteAccountBtn").disabled = true;
+    try {
+      await api.confirmIdentity();          // Google pop-up first, while the tap still counts
+      const toDelete = myMatches.slice();
+      cleanup();
+      for (const g of toDelete) await api.remove(g.id);
+      await api.deleteAccount();
+      myMatches = []; user = null;
+      toast("Your account has been deleted");
+      go(null);
+    } catch(e){
+      const c = (e && e.code) || "";
+      if (c.includes("popup-closed-by-user") || c.includes("cancelled-popup-request")) $("deleteErr").textContent = "Your account wasn't deleted. Confirm with Google to continue.";
+      else if (c.includes("user-mismatch")) $("deleteErr").textContent = "Choose the same Google account you signed in with.";
+      else if (c.includes("popup-blocked")) $("deleteErr").textContent = "Your browser blocked the Google window. Allow pop-ups for this site and try again.";
+      else if (c.includes("requires-recent-login")) $("deleteErr").textContent = "For security, sign out and sign back in, then try again.";
+      else $("deleteErr").textContent = "Couldn't delete your account. Check your connection and try again.";
+      if (!user) return;
+      route();
+    } finally { $("deleteAccountBtn").disabled = false; }
+  };
+
   /* ---------- Dashboard ---------- */
+  let myMatches = [];
   function showHome(){
+    $("nameForm").hidden = true; $("editNameBtn").hidden = false;
     showOnly("homeView");
     $("hello").textContent = user.name ? "Hi " + user.name.split(" ")[0] : "Your matches";
     $("upgradePanel").hidden = !user.isAnonymous;
     unsubs.push(api.myGames(user.uid, list => {
       list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      myMatches = list;
       const ul = $("matchList"); ul.innerHTML = "";
       $("noMatches").hidden = list.length > 0;
       list.forEach(g => {
